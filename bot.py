@@ -17,6 +17,8 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 # ---------------------------------------------------------------------------
@@ -174,6 +176,17 @@ def save_config(cfg: BotConfig) -> None:
         "timezone": cfg.timezone,
     }
     with CONFIG_PATH.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def save_ai_config(ai_cfg: AIConfig) -> None:
+    data = {
+        "groq_api_key": ai_cfg.groq_api_key,
+        "groq_model": ai_cfg.groq_model,
+        "temperature": ai_cfg.temperature,
+        "system_prompt": ai_cfg.system_prompt,
+    }
+    with AI_CONFIG_PATH.open("w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
@@ -346,6 +359,20 @@ class GroqScheduleGenerator:
 # ---------------------------------------------------------------------------
 
 
+# Ключи настроек для user_data
+SETTING_KEY = "awaiting_setting"
+
+SETTINGS_MAP = {
+    "set_model": ("🤖 Модель", "Введи название модели Groq (например llama-3.3-70b-versatile):"),
+    "set_temp": ("🌡 Temperature", "Введи temperature (0.0 — 2.0):"),
+    "set_prompt": ("📝 System prompt", "Введи новый system prompt:"),
+    "set_time": ("⏰ Время автопоста", "Введи время в формате HH:MM (например 22:00):"),
+    "set_tz": ("🌍 Таймзона", "Введи таймзону (например Asia/Novosibirsk):"),
+    "set_add_ch": ("➕ Добавить канал", "Введи ID и название канала через пробел:\nНапример: -1001234567890 Мой канал"),
+    "set_del_ch": ("🗑 Удалить канал", None),
+}
+
+
 def main_keyboard(config: BotConfig) -> InlineKeyboardMarkup:
     ch = config.channels[config.active_channel]
     return InlineKeyboardMarkup(
@@ -358,9 +385,32 @@ def main_keyboard(config: BotConfig) -> InlineKeyboardMarkup:
                     f"📍 Канал: {ch.name}", callback_data="pick_channel"
                 )
             ],
-            [InlineKeyboardButton("⚙️ Настройки ИИ", callback_data="ai_settings")],
+            [InlineKeyboardButton("⚙️ Настройки", callback_data="settings_menu")],
         ]
     )
+
+
+def settings_keyboard(config: BotConfig, ai_cfg: AIConfig) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(f"🤖 Модель: {ai_cfg.groq_model}", callback_data="set_model")],
+            [InlineKeyboardButton(f"🌡 Temperature: {ai_cfg.temperature}", callback_data="set_temp")],
+            [InlineKeyboardButton("📝 System prompt", callback_data="set_prompt")],
+            [InlineKeyboardButton(f"⏰ Автопост: {config.autopost_time}", callback_data="set_time")],
+            [InlineKeyboardButton(f"🌍 Таймзона: {config.timezone}", callback_data="set_tz")],
+            [InlineKeyboardButton("➕ Добавить канал", callback_data="set_add_ch")],
+            [InlineKeyboardButton("🗑 Удалить канал", callback_data="set_del_ch")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="back_main")],
+        ]
+    )
+
+
+def delete_channel_keyboard(config: BotConfig) -> InlineKeyboardMarkup:
+    rows = []
+    for idx, ch in enumerate(config.channels):
+        rows.append([InlineKeyboardButton(f"❌ {ch.name} ({ch.id})", callback_data=f"delch_{idx}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="settings_menu")])
+    return InlineKeyboardMarkup(rows)
 
 
 def day_picker_keyboard() -> InlineKeyboardMarkup:
@@ -516,24 +566,152 @@ class ScheduleBot:
                     reply_markup=main_keyboard(self.config),
                 )
 
-        # --- Настройки ИИ ---
-        elif data == "ai_settings":
-            self.ai_cfg = load_ai_config()
-            self.generator.reload(self.ai_cfg)
-            text = (
-                "⚙️ Настройки ИИ (ai_config.json)\n\n"
-                f"🤖 Модель: {self.ai_cfg.groq_model}\n"
-                f"🌡 Temperature: {self.ai_cfg.temperature}\n"
-                f"📝 System prompt:\n{self.ai_cfg.system_prompt}\n\n"
-                "Отредактируй ai_config.json и нажми эту кнопку снова."
+        # --- Меню настроек ---
+        elif data == "settings_menu":
+            context.user_data.pop(SETTING_KEY, None)
+            await query.message.reply_text(
+                "⚙️ Настройки бота",
+                reply_markup=settings_keyboard(self.config, self.ai_cfg),
             )
-            await query.message.reply_text(text, reply_markup=main_keyboard(self.config))
+
+        # --- Кнопки настроек (ожидание ввода) ---
+        elif data in SETTINGS_MAP:
+            label, prompt_text = SETTINGS_MAP[data]
+            if data == "set_del_ch":
+                if len(self.config.channels) <= 1:
+                    await query.message.reply_text(
+                        "❌ Нельзя удалить единственный канал.",
+                        reply_markup=settings_keyboard(self.config, self.ai_cfg),
+                    )
+                else:
+                    await query.message.reply_text(
+                        "Какой канал удалить?",
+                        reply_markup=delete_channel_keyboard(self.config),
+                    )
+            else:
+                context.user_data[SETTING_KEY] = data
+                await query.message.reply_text(
+                    prompt_text,
+                    reply_markup=InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("❌ Отмена", callback_data="settings_menu")]]
+                    ),
+                )
+
+        # --- Удаление канала ---
+        elif data.startswith("delch_"):
+            idx = int(data.split("_")[1])
+            if 0 <= idx < len(self.config.channels) and len(self.config.channels) > 1:
+                removed = self.config.channels.pop(idx)
+                if self.config.active_channel >= len(self.config.channels):
+                    self.config.active_channel = 0
+                save_config(self.config)
+                await query.message.reply_text(
+                    f"✅ Канал «{removed.name}» удалён.",
+                    reply_markup=settings_keyboard(self.config, self.ai_cfg),
+                )
+            else:
+                await query.message.reply_text(
+                    "❌ Не удалось удалить.",
+                    reply_markup=settings_keyboard(self.config, self.ai_cfg),
+                )
 
         # --- Назад ---
         elif data == "back_main":
+            context.user_data.pop(SETTING_KEY, None)
             await query.message.reply_text(
                 "🎮 Готов к работе. Выбирай:", reply_markup=main_keyboard(self.config)
             )
+
+    # ---- Обработка текстового ввода настроек ----
+
+    async def text_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        setting = context.user_data.pop(SETTING_KEY, None)
+        if not setting:
+            return
+
+        value = update.message.text.strip()
+        if not value:
+            await update.message.reply_text("❌ Пустое значение, попробуй ещё раз.")
+            context.user_data[SETTING_KEY] = setting
+            return
+
+        try:
+            if setting == "set_model":
+                self.ai_cfg.groq_model = value
+                save_ai_config(self.ai_cfg)
+                self.generator.reload(self.ai_cfg)
+                reply = f"✅ Модель: {value}"
+
+            elif setting == "set_temp":
+                temp = float(value)
+                if not 0.0 <= temp <= 2.0:
+                    raise ValueError("Temperature должна быть от 0.0 до 2.0")
+                self.ai_cfg.temperature = temp
+                save_ai_config(self.ai_cfg)
+                self.generator.reload(self.ai_cfg)
+                reply = f"✅ Temperature: {temp}"
+
+            elif setting == "set_prompt":
+                self.ai_cfg.system_prompt = value
+                save_ai_config(self.ai_cfg)
+                self.generator.reload(self.ai_cfg)
+                reply = f"✅ System prompt обновлён"
+
+            elif setting == "set_time":
+                parts = value.split(":")
+                if len(parts) != 2:
+                    raise ValueError("Формат: HH:MM")
+                h, m = int(parts[0]), int(parts[1])
+                if not (0 <= h <= 23 and 0 <= m <= 59):
+                    raise ValueError("Некорректное время")
+                self.config.autopost_time = value
+                save_config(self.config)
+                # Перезапускаем daily job
+                jobs = context.job_queue.get_jobs_by_name("daily_schedule")
+                for job in jobs:
+                    job.schedule_removal()
+                new_time = parse_post_time(value, self.tz)
+                context.job_queue.run_daily(
+                    self.scheduled_post, time=new_time, name="daily_schedule"
+                )
+                reply = f"✅ Автопост: {value}"
+
+            elif setting == "set_tz":
+                try:
+                    new_tz = ZoneInfo(value)
+                except (ZoneInfoNotFoundError, KeyError):
+                    raise ValueError(f"Таймзона '{value}' не найдена")
+                self.tz = new_tz
+                self.config.timezone = value
+                save_config(self.config)
+                reply = f"✅ Таймзона: {value}"
+
+            elif setting == "set_add_ch":
+                # Формат: -100123456 Название канала
+                first_space = value.find(" ")
+                if first_space == -1:
+                    raise ValueError("Формат: ID Название\nНапример: -1001234567890 Мой канал")
+                ch_id = int(value[:first_space])
+                ch_name = value[first_space + 1:].strip()
+                if not ch_name:
+                    raise ValueError("Укажи название канала после ID")
+                self.config.channels.append(Channel(name=ch_name, id=ch_id))
+                save_config(self.config)
+                reply = f"✅ Канал «{ch_name}» ({ch_id}) добавлен"
+
+            else:
+                reply = "❓ Неизвестная настройка"
+
+        except ValueError as e:
+            await update.message.reply_text(
+                f"❌ {e}",
+                reply_markup=settings_keyboard(self.config, self.ai_cfg),
+            )
+            return
+
+        await update.message.reply_text(
+            reply, reply_markup=settings_keyboard(self.config, self.ai_cfg)
+        )
 
     # ---- Автопостинг (22:00 → расписание на завтра) ----
 
@@ -579,6 +757,7 @@ def build_application(config: BotConfig, ai_cfg: AIConfig) -> Application:
     app.add_handler(CommandHandler("start", schedule_bot.start_command))
     app.add_handler(CommandHandler("generate", schedule_bot.generate_command))
     app.add_handler(CallbackQueryHandler(schedule_bot.button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, schedule_bot.text_handler))
 
     post_time = parse_post_time(config.autopost_time, tz)
     app.job_queue.run_daily(schedule_bot.scheduled_post, time=post_time, name="daily_schedule")
