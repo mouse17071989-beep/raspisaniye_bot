@@ -1,0 +1,12 @@
+{
+  "telegram_token": "YOUR_TELEGRAM_BOT_TOKEN",
+  "channels": [
+    {
+      "name": "Основной канал",
+      "id": -100000000000
+    }
+  ],
+  "active_channel": 0,
+  "autopost_time": "22:00",
+  "timezone": "Asia/Novosibirsk"
+}

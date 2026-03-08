@@ -1,0 +1,9 @@
+# Конфиги с секретами
+config.json
+ai_config.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
